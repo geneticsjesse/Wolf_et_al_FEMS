@@ -1,0 +1,1 @@
+This folder contains the R scripts and SRA accession project number for "Gut microbiome composition predicts summer core range size in a generalist and specialist ungulate"

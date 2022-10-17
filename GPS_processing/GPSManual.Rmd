@@ -1,0 +1,226 @@
+---
+title: "<center>GPS Processing Manual – Wildlife and Applied Genomics Lab<center>"
+author: "<center>JFW<center>"
+date: "<center>September 11, 2020<center>"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+  pdf_document: default
+theme: cerulean
+---
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 12px;
+  }
+td {  /* Table  */
+  font-size: 8px;
+}
+h1.title {
+  font-size: 38px;
+  color: DarkGreen;
+}
+h1 { /* Header 1 */
+  font-size: 28px;
+  color: DarkBlue;
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+  color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Times New Roman", Times, serif;
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 12px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 14px;
+}
+body {
+text-align: justify
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE)
+```
+# This is a general manual for dealing with and filtering/cleaning GPS data from wildlife GPS collars
+
+### Title: GPS data filtering/cleaning
+### Purpose: Filter and clean GPS data for downstream analysis
+### Author: JFW
+### Input: .csvs of raw data
+### Date: September 11 2020
+### Output: single .csv file with all individual data files cleaned and ready for downstream analysis, seasonal data csvs, figure of where movement rates exceed certain value
+
+## General data filtering and cleaning
+### Environment setup
+```{r Environment setup, echo = TRUE, message = FALSE, warning = FALSE, eval = TRUE}
+libs <- c('data.table', 'ggplot2', 'dplyr', 'readr', 'rgdal')
+lapply(libs, require, character.only = TRUE)
+```
+### Read in all .csv files (need to have working directory set to where all the raw files are), combine, and read back in
+```{r Combine all .csvs into one, echo = TRUE, message = FALSE, warning = FALSE, eval = TRUE}
+allgps <- list.files(full.names = TRUE) %>% 
+  lapply(read_csv) %>% 
+  bind_rows 
+# Export to new csv
+#write.csv(allgps, combinedgps.csv)
+#Read in exported file, encoding it with Latin1 fixes a gsub error I kept getting
+allgps <- read_csv("output/combinedGPS.csv", locale = locale(encoding = "Latin1"))
+```
+### Filter combined csv to only contain relevant information (will be different for everyone) and set proj4string, which tells R where your animals are located according to a UTM zone
+```{r Filter combined csv to only contain relevant information, echo = TRUE, warning = FALSE, eval = TRUE}
+#Select only relevant columns of data
+gps_simp <-allgps %>%
+  select(CollarID, `Mort. Status` ,LMT_Date, LMT_Time, `Height [m]`, DOP,  `Latitude [°]`,`Longitude [°]`,
+             FixType, Easting, Northing, AnimalID)
+# Setting object to utm zone 9N - THIS DEPENDS ON WHERE THE DATA COMES FROM - CHECK FOR YOUR UTM ZONE
+utm9N <-'+proj=utm +zone=9 ellps=WGS84'
+# Renaming columns for simplicity
+gps_simp <- gps_simp %>%
+  rename(Height = `Height [m]`)%>%
+  rename (mortality = `Mort. Status`)%>%
+  rename (latitude = `Latitude [°]`)%>%
+  rename (longitude = `Longitude [°]`)
+```
+
+### Filter to remove any lat/longs that are N/A, remove any mortality signals, create a minimum/maximum height value, and ensure filter for whatever date range you're looking at. This will vary on the individual dataset and objectives as well
+``` {r Filter further, echo = TRUE, warning = FALSE, eval = TRUE}
+# Histogram of altitude before filtering
+hist(gps_simp$Height)
+# Filtering data for erroneous points, mortality signals, and height restrictions
+gps_simp_clean <- gps_simp %>%
+  filter (latitude!="NA") %>%
+  filter (longitude!= "NA")%>%
+  filter(mortality=="normal")%>%
+  filter(Height > 600, `Height` <2500)%>%
+  filter(LMT_Date >= as.Date("2018-01-01") & LMT_Date <= as.Date("2020-10-31"))
+# Histogram of altitude after filtering
+hist(gps_simp_clean$Height)
+# Export filtered data file
+#write.csv(gps_simp_clean, "output/GPS_Simplified_Filtered.csv")
+```
+### Create a date time variable, and set boundaries
+``` {r Create a date time variable, and set boundaries, message = FALSE, echo = TRUE, warning = FALSE, eval = TRUE}
+# paste date and time to new variable 
+datetime <- (paste0 (gps_simp_clean$LMT_Date, sep = " ", gps_simp_clean$LMT_Time))
+# bind DateTime to data frame
+gps_simp_clean$datetime <- datetime
+# making data a data table
+gps_simp_clean_dt<-as.data.table(gps_simp_clean)
+# Set variable LMTdatetime as proper format to use further
+gps_simp_clean_dt [,LMTdatetime := as.POSIXct(datetime)]
+# changing coordinates and setting boundaries 
+# This will create an Easting and Northing column depending on your Longitude/Latitude
+gps_simp_clean_dt[, c('EASTING', 'NORTHING') := as.data.table(project(cbind(longitude, latitude), utm9N))]
+# What do our easting/northing points look like?
+plot(gps_simp_clean_dt$EASTING, gps_simp_clean_dt$NORTHING,
+     xaxt='n', yaxt='n', ann=FALSE)
+# Generate some sort of boundaries if you see obviously erroneous points in plot above - values below are just random, boundaries depend on individual datasets
+lowEast <- 100; highEast <- 100
+lowNorth <- 4000; highNorth <- 5000
+# Filter by bounds - This will again depend on your study extent but will help
+# get rid of those random points off in space
+gps_simp_clean_dt <- gps_simp_clean_dt[(lowEast < EASTING & EASTING < highEast) &
+                                     (lowNorth < NORTHING & EASTING < highNorth)]
+# check to see what it looks like (I removed axes as location data is sensitive)
+plot(gps_simp_clean_dt$EASTING, gps_simp_clean_dt$NORTHING,
+     xaxt='n', yaxt='n', ann=FALSE)
+```
+
+
+
+
+### Calculate number of GPS fixes per individual
+``` {r Calculate number of GPS fixes per individual, message = FALSE, echo = TRUE, warning = FALSE, eval = TRUE}
+#Produces tibble with animal ID and number of fixes
+#Animalid is unique ID identifying individual animal
+fixes_per_ind <- group_by(gps_simp_clean_dt) %>%
+  group_by(AnimalID) %>%
+  summarise(number_of_fixes = n())
+#write.csv(fixes_per_ind, "output/NumberofFixesPerInd.csv")
+```
+
+### Calculate step length to determine distance between fixes, time between fixes, and ultimately, a movement rate
+``` {r Calculate step length to determine distance between fixes, time between fixes, and ultimately, a movement rate, message = FALSE, echo = TRUE, warning = FALSE, eval = TRUE}
+# data.table Step Length 
+# This next part will help you produce a simple step length and then a movement rate so that you can 
+# then remove any biologically impossible movements (i.e., 30km/hr movement rates) 
+#Sort Data
+gps_simp_clean_dt <- gps_simp_clean_dt[order(gps_simp_clean_dt$AnimalID, 
+                                         gps_simp_clean_dt$datetime),]
+# Set columns
+time.col <- 'LMTdatetime'
+coord.cols <- c('EASTING', 'NORTHING')
+# Create lag and dif column names
+lag.cols <- paste('lag', coord.cols, sep = '')
+difference.cols <- c('difX', 'difY')
+lag.time.col <- paste0('lag', time.col)
+dif.time.col <- paste0('dif', time.col)
+# Use shift  to create lagged cols
+gps_simp_clean_dt[order(get(time.col)), (lag.cols) := shift(.SD, 1, NA, 'lag'),
+                by = .(CollarID),
+                .SDcols = coord.cols]
+# Find the difference squared between all points in each x,y separately
+gps_simp_clean_dt[, (difference.cols) := .((get(coord.cols[1]) - get(lag.cols[1])) ^2,
+                                         (get(coord.cols[2]) - get(lag.cols[2])) ^2)]
+# Square root the summed difference for a simple step length
+gps_simp_clean_dt[, simpleStep := sqrt(rowSums(.SD)),
+                .SDcols = difference.cols]
+## Delta Time
+gps_simp_clean_dt[order(get(time.col)), (lag.time.col) := shift(.SD, 1, NA, 'lag'), 
+                by = .(CollarID),
+                .SDcols = time.col]
+# difference in time in hours
+gps_simp_clean_dt[, (dif.time.col) := as.numeric(get(time.col) - get(lag.time.col), units = 'hours')]
+# Simple step length divided by time difference - something here is generating infinites
+gps_simp_clean_dt[, moveRate := simpleStep / (get(dif.time.col))]
+# Output pdf of locs xy BEFORE movement rate cutoff and flag the locs----
+# where moverate is higher than 15 km/h. If you simply want to view the plots
+# and not save them you can just run the lines in between pdf and dev.off()
+#pdf('graphics/flaglocs30kmh.pdf')
+moverateflag<- ggplot(gps_simp_clean_dt) +
+  geom_point(aes(EASTING,NORTHING)) + 
+  geom_point(aes(EASTING, NORTHING), color = 'red', data = gps_simp_clean_dt[moveRate > 30000]) + 
+  labs( gps_simp_clean_dt= 'EASTING', y = 'NORTHING') + guides(color = FALSE)+
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),
+          axis.text.y=element_blank(),axis.ticks=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),legend.position="none",
+          panel.background=element_blank(),panel.border=element_blank(),panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),plot.background=element_blank())
+moverateflag
+#dev.off()
+# Drop more than 15km/hr movements
+gps_simp_clean2_dt <- gps_simp_clean_dt%>%
+  filter(moveRate<30000)
+# Export it 
+#write.csv(gps_simp_clean2_dt, 'output/gps_FilteredCleaned.csv')
+```
+## Seasonal data preparation - these dates correspond to my mountain goat data, will change depending on study system
+### Setting up seasonal data sets 
+
+``` {r Seasonal data prepration, message = FALSE, echo = TRUE, warning = FALSE, eval = TRUE}
+winter2018 <- gps_simp_clean2_dt %>%
+  filter(LMT_Date >= as.Date("2017-12-01") & LMT_Date <= as.Date("2018-04-30"))
+winter2019 <- gps_simp_clean2_dt %>%
+  filter(LMT_Date >= as.Date("2018-12-01") & LMT_Date <= as.Date("2019-04-30"))
+winter2020<- gps_simp_clean2_dt %>%
+  filter (LMT_Date >=as.Date("2019-12-01") & LMT_Date <= as.Date("2020-04-30"))
+winter <- rbind(winter2018, winter2019, winter2020)
+#write.csv(winter, "output/winterGPS.csv")
+#### Setting up seasonal data sets - SUMMER 
+summer2018 <- gps_simp_clean2_dt %>%
+  filter(LMT_Date >= as.Date("2018-05-01") & LMT_Date <= as.Date("2018-10-31"))
+summer2019 <- gps_simp_clean2_dt %>%
+  filter(LMT_Date >= as.Date("2019-05-01") & LMT_Date <= as.Date("2019-10-31"))
+summer2020 <- gps_simp_clean2_dt%>%
+  filter (LMT_Date >=as.Date("2020-05-01") & LMT_Date <= as.Date("2020-10-31"))
+summer <- rbind(summer2018, summer2019, summer2020)
+#write.csv(summer, "output/summerGPS.csv")
